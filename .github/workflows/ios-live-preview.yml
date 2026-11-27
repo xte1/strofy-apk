@@ -1,0 +1,325 @@
+name: Live iPhone Simulator (Builder Mobile)
+run-name: "Live iPhone Preview #${{ github.run_number }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_path:
+        description: Project folder relative to the repository root
+        required: false
+        default: .
+        type: string
+      scheme:
+        description: Xcode scheme (empty = automatic)
+        required: false
+        default: ""
+        type: string
+      minutes:
+        description: How many minutes the live session stays open
+        required: false
+        default: "30"
+        type: string
+      device:
+        description: "fast = smaller screen (smoother stream), best = iPhone Pro"
+        required: false
+        default: fast
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-live-preview
+  cancel-in-progress: true
+
+jobs:
+  live:
+    name: Interactive iPhone simulator
+    runs-on: macos-26
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # The phone appears first; the app is built and installed while you already look at it.
+      - name: Boot the simulator and prepare tools in parallel
+        id: prep
+        shell: bash
+        env:
+          DEVICE_PROFILE: ${{ inputs.device }}
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+          HOMEBREW_NO_ENV_HINTS: "1"
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+
+          DEVICE_ID=$(xcrun simctl list devices available -j | python3 -c '
+          import json, os, sys
+          data = json.load(sys.stdin)["devices"]
+          fast = os.environ.get("DEVICE_PROFILE", "fast") == "fast"
+          best = None
+          for runtime in sorted(data.keys(), reverse=True):
+              if "iOS" not in runtime:
+                  continue
+              phones = [d for d in data[runtime] if d.get("isAvailable") and d["name"].startswith("iPhone")]
+              if not phones:
+                  continue
+              pick = None
+              if fast:
+                  # Fewer pixels = a much smoother stream through the tunnel.
+                  for prefix in ("iPhone SE", "iPhone 11", "iPhone 16e"):
+                      match = [d for d in phones if d["name"].startswith(prefix)]
+                      if match:
+                          pick = match[0]
+                          break
+              if pick is None:
+                  pro = [d for d in phones if d["name"].endswith("Pro")]
+                  pick = pro[0] if pro else phones[0]
+              best = pick
+              break
+          print(best["udid"] if best else "")
+          ')
+
+          if [[ -z "$DEVICE_ID" ]]; then
+            echo "::error::No available iPhone simulator on this runner"
+            exit 1
+          fi
+          echo "device_id=$DEVICE_ID" >> "$GITHUB_OUTPUT"
+
+          # 1) start booting (the next step waits for it)
+          xcrun simctl boot "$DEVICE_ID" || true
+
+          # 2) download everything else in the background while the simulator boots
+          nohup bash -c '
+            curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz \
+              | tar -xz -C "$RUNNER_TEMP" cloudflared \
+              || { brew install cloudflared && cp "$(command -v cloudflared)" "$RUNNER_TEMP/cloudflared"; }
+            chmod +x "$RUNNER_TEMP/cloudflared" || true
+            echo done > "$RUNNER_TEMP/cf.done"
+          ' > "$RUNNER_TEMP/cf.log" 2>&1 &
+
+          nohup bash -c '
+            mkdir -p "$RUNNER_TEMP/ss"
+            npm install --prefix "$RUNNER_TEMP/ss" --no-audit --no-fund serve-sim@latest
+            echo done > "$RUNNER_TEMP/ss.done"
+          ' > "$RUNNER_TEMP/ss.log" 2>&1 &
+
+          if find . -maxdepth 3 -name 'project.yml' -not -path '*/node_modules/*' | grep -q .; then
+            nohup bash -c 'brew install xcodegen; echo done > "$RUNNER_TEMP/xg.done"' \
+              > "$RUNNER_TEMP/xg.log" 2>&1 &
+          else
+            echo done > "$RUNNER_TEMP/xg.done"
+          fi
+
+      - name: Start the simulator stream and open the tunnel
+        shell: bash
+        env:
+          DEVICE_ID: ${{ steps.prep.outputs.device_id }}
+        run: |
+          set -euo pipefail
+
+          wait_for() {
+            local file="$1" tries="$2"
+            for _ in $(seq 1 "$tries"); do
+              [[ -f "$file" ]] && return 0
+              sleep 2
+            done
+            return 1
+          }
+
+          xcrun simctl bootstatus "$DEVICE_ID" -b
+          xcrun simctl status_bar "$DEVICE_ID" override --time "9:41" --batteryState charged --batteryLevel 100 || true
+
+          # serve-sim refuses requests that arrive through a tunnel unless it has an auth token.
+          # The token is random, masked in logs, and only reaches Builder Mobile through the artifact.
+          TOKEN=$(openssl rand -hex 24)
+          echo "::add-mask::$TOKEN"
+
+          SS_BIN="$RUNNER_TEMP/ss/node_modules/.bin/serve-sim"
+          wait_for "$RUNNER_TEMP/ss.done" 90 || true
+          if [[ ! -x "$SS_BIN" ]]; then
+            echo "Falling back to npx"
+            SS_CMD=(npx --yes serve-sim@latest)
+          else
+            SS_CMD=("$SS_BIN")
+          fi
+
+          # Software JPEG stream: GitHub macOS runners are virtual machines without H.264 encode.
+          nohup "${SS_CMD[@]}" --codec mjpeg --panes none --fit -p 3200 --auth-token "$TOKEN" \
+            > "$RUNNER_TEMP/serve-sim.log" 2>&1 &
+          disown || true
+
+          READY=0
+          for _ in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:3200" > /dev/null 2>&1; then READY=1; break; fi
+            sleep 2
+          done
+          if [[ "$READY" != "1" ]]; then
+            echo "::error::serve-sim did not start"
+            tail -50 "$RUNNER_TEMP/serve-sim.log" || true
+            exit 1
+          fi
+
+          wait_for "$RUNNER_TEMP/cf.done" 60 || true
+          CF="$RUNNER_TEMP/cloudflared"
+          if [[ ! -x "$CF" ]]; then
+            echo "::error::cloudflared is not available"
+            tail -30 "$RUNNER_TEMP/cf.log" || true
+            exit 1
+          fi
+
+          nohup "$CF" tunnel --url http://127.0.0.1:3200 --no-autoupdate \
+            > "$RUNNER_TEMP/tunnel.log" 2>&1 &
+          disown || true
+
+          URL=""
+          for _ in $(seq 1 60); do
+            URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$RUNNER_TEMP/tunnel.log" | head -1 || true)
+            if [[ -n "$URL" ]]; then break; fi
+            sleep 1
+          done
+
+          if [[ -z "$URL" ]]; then
+            echo "::error::Could not obtain a tunnel address"
+            tail -30 "$RUNNER_TEMP/tunnel.log" | sed -E 's#https://[a-zA-Z0-9-]+\.trycloudflare\.com#<hidden>#g' || true
+            exit 1
+          fi
+
+          # Never print the address. The #token fragment signs the viewer in (serve-sim sets a cookie).
+          FULL="$URL/#token=$TOKEN"
+          echo "::add-mask::$URL"
+          echo "::add-mask::$FULL"
+          mkdir -p "$GITHUB_WORKSPACE/live-url"
+          printf '%s' "$FULL" > "$GITHUB_WORKSPACE/live-url/url.txt"
+          # give the new tunnel a moment to start routing
+          sleep 3
+
+      - name: Publish the address to Builder Mobile
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-preview-url
+          path: live-url/url.txt
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Build the app and install it in the simulator
+        shell: bash
+        env:
+          PROJECT_PATH: ${{ inputs.project_path }}
+          REQUESTED_SCHEME: ${{ inputs.scheme }}
+          DEVICE_ID: ${{ steps.prep.outputs.device_id }}
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${PROJECT_PATH// }" ]]; then PROJECT_PATH="."; fi
+          ROOT="$GITHUB_WORKSPACE/$PROJECT_PATH"
+          if [[ ! -d "$ROOT" ]]; then
+            echo "::error::Project directory not found: $PROJECT_PATH"
+            exit 1
+          fi
+
+          find_project() {
+            find "$1" -maxdepth 5 -name '*.xcodeproj' \
+              -not -path '*/Pods/*' -not -path '*/node_modules/*' \
+              -not -path '*/.build/*' -not -path '*/build/*' -not -path '*/DerivedData/*' \
+              -print 2>/dev/null | sort | head -1 || true
+          }
+
+          SEARCH="$ROOT"
+          if [[ -d "$ROOT/ios" ]]; then SEARCH="$ROOT/ios"; fi
+
+          APP_PROJECT=$(find_project "$SEARCH")
+
+          if [[ -z "$APP_PROJECT" ]]; then
+            YML=$(find "$ROOT" -maxdepth 3 -name 'project.yml' -not -path '*/node_modules/*' -print 2>/dev/null | head -1 || true)
+            if [[ -n "$YML" ]]; then
+              echo "XcodeGen spec found: $YML"
+              for _ in $(seq 1 90); do [[ -f "$RUNNER_TEMP/xg.done" ]] && break; sleep 2; done
+              command -v xcodegen >/dev/null 2>&1 || brew install xcodegen
+              (cd "$(dirname "$YML")" && xcodegen generate)
+              APP_PROJECT=$(find_project "$ROOT")
+            fi
+          fi
+
+          if [[ -z "$APP_PROJECT" ]]; then
+            echo "::error::No Xcode project found in '$PROJECT_PATH'. The live simulator needs an iOS app project (.xcodeproj or XcodeGen project.yml)."
+            exit 1
+          fi
+
+          IOS_DIR="$(dirname "$APP_PROJECT")"
+          echo "Detected project: $APP_PROJECT"
+
+          KIND="project"
+          CONTAINER="$APP_PROJECT"
+
+          if [[ -f "$IOS_DIR/Podfile" ]]; then
+            command -v pod >/dev/null 2>&1 || sudo gem install cocoapods
+            pod install --project-directory="$IOS_DIR"
+          fi
+
+          WS=$(find "$IOS_DIR" -maxdepth 1 -name '*.xcworkspace' -print -quit 2>/dev/null || true)
+          if [[ -n "$WS" ]]; then
+            KIND="workspace"
+            CONTAINER="$WS"
+          fi
+
+          SCHEMES=$(xcodebuild -list -json "-$KIND" "$CONTAINER" | jq -r '(.workspace.schemes // .project.schemes // [])[]')
+          SCHEME=""
+          REQUESTED="$(echo "$REQUESTED_SCHEME" | xargs || true)"
+          if [[ -n "$REQUESTED" ]] && grep -Fxq "$REQUESTED" <<<"$SCHEMES"; then SCHEME="$REQUESTED"; fi
+          if [[ -z "$SCHEME" ]]; then SCHEME=$(grep -v '^Pods' <<<"$SCHEMES" | head -1 || true); fi
+          if [[ -z "$SCHEME" ]]; then
+            echo "::error::No Xcode scheme found in $CONTAINER"
+            exit 1
+          fi
+          echo "Using scheme: $SCHEME"
+
+          DERIVED="$RUNNER_TEMP/LiveBuild"
+          xcodebuild build \
+            "-$KIND" "$CONTAINER" \
+            -scheme "$SCHEME" \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination "platform=iOS Simulator,id=$DEVICE_ID" \
+            -derivedDataPath "$DERIVED" \
+            CODE_SIGNING_ALLOWED=NO \
+            ONLY_ACTIVE_ARCH=YES \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            DEBUG_INFORMATION_FORMAT=dwarf \
+            > "$RUNNER_TEMP/build.log" 2>&1 || {
+              grep -E "error:" "$RUNNER_TEMP/build.log" | tail -30 || true
+              echo "::error::app build failed for scheme $SCHEME"
+              exit 1
+            }
+
+          APP=$(find "$DERIVED/Build/Products" -maxdepth 2 -type d -name '*.app' -path '*iphonesimulator*' -print 2>/dev/null | head -1 || true)
+          if [[ -z "$APP" ]]; then
+            echo "::error::App bundle not found after build (is '$SCHEME' an iOS app?)"
+            exit 1
+          fi
+
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")
+          echo "Installing $BUNDLE_ID"
+          xcrun simctl install "$DEVICE_ID" "$APP"
+          xcrun simctl launch "$DEVICE_ID" "$BUNDLE_ID"
+
+      - name: Keep the live session open
+        shell: bash
+        env:
+          MINUTES: ${{ inputs.minutes }}
+        run: |
+          MIN="${MINUTES:-30}"
+          if ! [[ "$MIN" =~ ^[0-9]+$ ]]; then MIN=30; fi
+          if (( MIN > 110 )); then MIN=110; fi
+          echo "Live session open for $MIN minutes. Stop it from the app to save minutes."
+          END=$((SECONDS + MIN * 60))
+          while (( SECONDS < END )); do
+            sleep 15
+            if ! pgrep -f "cloudflared tunnel" > /dev/null; then
+              echo "The tunnel stopped."
+              break
+            fi
+          done
